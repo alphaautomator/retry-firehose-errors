@@ -1,7 +1,8 @@
-import { S3Client, ListObjectsV2Command, GetObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, ListObjectsV2Command, GetObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { FirehoseClient, PutRecordBatchCommand } from '@aws-sdk/client-firehose';
 import * as dotenv from 'dotenv';
 import { Readable } from 'stream';
+import Bluebird from 'bluebird';
 
 // Load environment variables
 dotenv.config();
@@ -21,13 +22,26 @@ interface FirehoseRecord {
   [key: string]: any;
 }
 
+interface ProcessedFile {
+  key: string;
+  records: FirehoseRecord[];
+}
+
+interface DateHourTask {
+  date: Date;
+  hour: number;
+  prefix: string;
+}
+
 class FirehoseErrorRetry {
   private s3Client: S3Client;
   private firehoseClient: FirehoseClient;
   private s3Bucket: string;
   private s3Prefix: string;
   private firehoseArn: string;
-  private readonly maxEventsToProcess: number = 10;
+  private startDate: Date;
+  private endDate: Date;
+  private readonly concurrency: number = 50;
 
   constructor() {
     const region = process.env.AWS_REGION || 'us-east-1';
@@ -38,6 +52,16 @@ class FirehoseErrorRetry {
     this.s3Bucket = process.env.S3_BUCKET || '';
     this.s3Prefix = process.env.S3_PREFIX || '';
     this.firehoseArn = process.env.FIREHOSE_ARN || '';
+
+    // Parse date range
+    const startDateStr = process.env.START_DATE || '2025-12-25';
+    const endDateStr = process.env.END_DATE || '2026-01-11';
+    
+    this.startDate = new Date(startDateStr);
+    this.startDate.setHours(0, 0, 0, 0);
+    
+    this.endDate = new Date(endDateStr);
+    this.endDate.setHours(23, 59, 59, 999);
 
     if (!this.s3Bucket) {
       throw new Error('S3_BUCKET is not defined in .env file');
@@ -50,53 +74,129 @@ class FirehoseErrorRetry {
     console.log(`  S3 Bucket: ${this.s3Bucket}`);
     console.log(`  S3 Prefix: ${this.s3Prefix}`);
     console.log(`  Firehose ARN: ${this.firehoseArn}`);
+    console.log(`  Date Range: ${this.startDate.toISOString().split('T')[0]} to ${this.endDate.toISOString().split('T')[0]}`);
+    console.log(`  Processing: All events`);
+    console.log(`  Concurrency: ${this.concurrency}`);
   }
 
   /**
-   * Get the date 5 days ago
+   * Generate all dates between start and end date
    */
-  private getFiveDaysAgo(): Date {
-    const date = new Date();
-    date.setDate(date.getDate() - 1);
-    date.setHours(0, 0, 0, 0);
-    return date;
+  private generateDateRange(): Date[] {
+    const dates: Date[] = [];
+    const currentDate = new Date(this.startDate);
+
+    while (currentDate <= this.endDate) {
+      dates.push(new Date(currentDate));
+      currentDate.setDate(currentDate.getDate() + 1);
+    }
+
+    return dates;
   }
 
   /**
-   * List all S3 objects that are 5 days old
+   * Format date to S3 path (YYYY/MM/DD/HH)
    */
-  private async listS3Objects(): Promise<string[]> {
-    const fiveDaysAgo = this.getFiveDaysAgo();
-    console.log(`\nFetching objects from ${fiveDaysAgo.toISOString()} onwards...`);
-    
+  private formatDateHourToS3Path(date: Date, hour: number): string {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    const hourStr = String(hour).padStart(2, '0');
+    return `${year}/${month}/${day}/${hourStr}`;
+  }
+
+  /**
+   * Generate all date-hour combinations for the date range
+   */
+  private generateDateHourTasks(): DateHourTask[] {
+    const tasks: DateHourTask[] = [];
+    const dates = this.generateDateRange();
+
+    for (const date of dates) {
+      for (let hour = 0; hour < 24; hour++) {
+        const dateHourPath = this.formatDateHourToS3Path(date, hour);
+        const prefix = this.s3Prefix ? `${this.s3Prefix}${dateHourPath}/` : `${dateHourPath}/`;
+        
+        tasks.push({
+          date: new Date(date),
+          hour,
+          prefix,
+        });
+      }
+    }
+
+    return tasks;
+  }
+
+  /**
+   * List S3 objects for a specific date-hour prefix
+   */
+  private async listS3ObjectsForPrefix(prefix: string): Promise<string[]> {
     const objects: string[] = [];
     let continuationToken: string | undefined;
 
     do {
       const command = new ListObjectsV2Command({
         Bucket: this.s3Bucket,
-        Prefix: this.s3Prefix,
+        Prefix: prefix,
         ContinuationToken: continuationToken,
       });
 
-      const response = await this.s3Client.send(command);
+      try {
+        const response = await this.s3Client.send(command);
 
-      if (response.Contents) {
-        for (const obj of response.Contents) {
-          if (obj.Key && obj.LastModified) {
-            // Check if the object is from 5 days ago
-            if (obj.LastModified >= fiveDaysAgo) {
+        if (response.Contents) {
+          for (const obj of response.Contents) {
+            if (obj.Key) {
               objects.push(obj.Key);
             }
           }
         }
-      }
 
-      continuationToken = response.NextContinuationToken;
+        continuationToken = response.NextContinuationToken;
+      } catch (error) {
+        // Silently skip if prefix doesn't exist
+        break;
+      }
     } while (continuationToken);
 
-    console.log(`Found ${objects.length} objects from the last 5 days`);
     return objects;
+  }
+
+  /**
+   * Process a single date-hour task (list objects)
+   */
+  private async processDateHourTask(task: DateHourTask): Promise<string[]> {
+    const objects = await this.listS3ObjectsForPrefix(task.prefix);
+    
+    if (objects.length > 0) {
+      console.log(`  ✓ ${task.prefix}: Found ${objects.length} object(s)`);
+    }
+    
+    return objects;
+  }
+
+  /**
+   * List all S3 objects within the date range using date-hour-based prefixes with parallel processing
+   */
+  private async listS3Objects(): Promise<string[]> {
+    console.log(`\nFetching objects from ${this.startDate.toISOString().split('T')[0]} to ${this.endDate.toISOString().split('T')[0]}...`);
+    
+    const tasks = this.generateDateHourTasks();
+    console.log(`Processing ${tasks.length} date-hour combinations with concurrency ${this.concurrency}...\n`);
+    
+    // Process tasks in parallel with concurrency limit using Bluebird
+    const results = await Bluebird.map(
+      tasks,
+      (task: DateHourTask) => this.processDateHourTask(task),
+      { concurrency: this.concurrency }
+    );
+
+    // Flatten results
+    const allObjects = results.flat();
+
+    console.log(`\nTotal objects found: ${allObjects.length}`);
+    return allObjects;
   }
 
   /**
@@ -159,20 +259,14 @@ class FirehoseErrorRetry {
     }
   }
 
-  /**
-   * Filter records by eventName
-   */
-  private filterAppointmentPatchedRecords(records: FirehoseRecord[]): FirehoseRecord[] {
-    return records.filter(record => record.eventName === 'appointmentPatched');
-  }
 
   /**
-   * Send records to Firehose in batches
+   * Send records to Firehose in batches and return success status
    */
-  private async sendToFirehose(records: FirehoseRecord[]): Promise<void> {
+  private async sendToFirehose(records: FirehoseRecord[]): Promise<boolean> {
     if (records.length === 0) {
       console.log('No records to send to Firehose');
-      return;
+      return true;
     }
 
     // Extract delivery stream name from ARN
@@ -215,6 +309,43 @@ class FirehoseErrorRetry {
     }
 
     console.log(`\nTotal: ${successCount} successful, ${failureCount} failed`);
+    return failureCount === 0;
+  }
+
+  /**
+   * Delete S3 objects after successful processing (parallel with concurrency)
+   */
+  private async deleteS3Objects(keys: string[]): Promise<void> {
+    if (keys.length === 0) {
+      return;
+    }
+
+    console.log(`\nDeleting ${keys.length} processed S3 objects with concurrency ${this.concurrency}...`);
+
+    const results = await Bluebird.map(
+      keys,
+      async (key: string) => {
+        try {
+          const command = new DeleteObjectCommand({
+            Bucket: this.s3Bucket,
+            Key: key,
+          });
+
+          await this.s3Client.send(command);
+          console.log(`  ✓ Deleted: ${key}`);
+          return { key, success: true };
+        } catch (error) {
+          console.error(`  ✗ Failed to delete ${key}:`, error);
+          return { key, success: false, error };
+        }
+      },
+      { concurrency: this.concurrency }
+    );
+
+    const successCount = results.filter(r => r.success).length;
+    const failureCount = results.filter(r => !r.success).length;
+
+    console.log(`\nDeletion complete: ${successCount} successful, ${failureCount} failed`);
   }
 
   /**
@@ -232,48 +363,87 @@ class FirehoseErrorRetry {
         return;
       }
 
-      // Step 2: Download, decode, and parse objects until we have enough records
-      console.log('\nDownloading and parsing S3 objects...');
-      let filteredRecords: FirehoseRecord[] = [];
-      let totalRecordsProcessed = 0;
+      // Step 2: Download, decode, and parse all objects in parallel
+      console.log(`\nDownloading and parsing ${s3Keys.length} S3 objects with concurrency ${this.concurrency}...\n`);
+      const processedFiles: ProcessedFile[] = [];
       const eventNames = new Set<string>();
       
-      for (const key of s3Keys) {
-        if (filteredRecords.length >= this.maxEventsToProcess) {
-          console.log(`\n✓ Reached target of ${this.maxEventsToProcess} records. Stopping S3 fetch.`);
-          break;
-        }
+      // Process S3 keys in parallel with concurrency limit
+      const results = await Bluebird.map(
+        s3Keys,
+        async (key: string) => {
+          console.log(`  Processing: ${key}`);
+          const records = await this.downloadAndDecodeS3Object(key);
 
-        console.log(`Processing: ${key}`);
-        const records = await this.downloadAndDecodeS3Object(key);
-        totalRecordsProcessed += records.length;
+          // Track event names
+          records.forEach(record => {
+            if (record.eventName) {
+              eventNames.add(record.eventName);
+            }
+          });
 
-        // Track event names
-        records.forEach(record => {
-          if (record.eventName) {
-            eventNames.add(record.eventName);
+          if (records.length > 0) {
+            console.log(`    ✓ Found ${records.length} event(s)`);
+            return { key, records, totalRecords: records.length };
+          } else {
+            console.log(`    - No events`);
+            return { key, records: [], totalRecords: 0 };
           }
-        });
+        },
+        { concurrency: this.concurrency }
+      );
 
-        // Filter and add appointmentPatched events
-        const matchingRecords = this.filterAppointmentPatchedRecords(records);
-        filteredRecords = filteredRecords.concat(matchingRecords);
+      // Collect results
+      let totalRecordsProcessed = 0;
 
-        console.log(`  Found ${matchingRecords.length} appointmentPatched events (total so far: ${filteredRecords.length})`);
+      results.forEach(result => {
+        totalRecordsProcessed += result.totalRecords;
+        if (result.records.length > 0) {
+          processedFiles.push({ key: result.key, records: result.records });
+        }
+      });
+
+      console.log(`\nTotal records to process: ${totalRecordsProcessed}`);
+      console.log(`Event names found: ${Array.from(eventNames).join(', ')}`)
+
+      // Step 3: Process files and send to Firehose in parallel
+      console.log(`\n📤 Sending ${processedFiles.length} file(s) to Firehose with concurrency ${this.concurrency}...\n`);
+      
+      const sendResults = await Bluebird.map(
+        processedFiles,
+        async (file: ProcessedFile) => {
+          console.log(`  Processing: ${file.key} (${file.records.length} record(s))`);
+          
+          // Send to Firehose
+          const success = await this.sendToFirehose(file.records);
+
+          if (success) {
+            console.log(`    ✓ Successfully sent ${file.records.length} record(s)`);
+            return { key: file.key, success: true, recordCount: file.records.length };
+          } else {
+            console.log(`    ✗ Failed to send records. Skipping deletion.`);
+            return { key: file.key, success: false, recordCount: file.records.length };
+          }
+        },
+        { concurrency: this.concurrency }
+      );
+
+      // Collect successful files for deletion
+      const filesToDelete = sendResults
+        .filter(result => result.success)
+        .map(result => result.key);
+
+      const sentCount = sendResults
+        .filter(result => result.success)
+        .reduce((sum, result) => sum + result.recordCount, 0);
+
+      // Step 4: Delete successfully processed S3 files
+      if (filesToDelete.length > 0) {
+        await this.deleteS3Objects(filesToDelete);
       }
 
-      console.log(`\nTotal records processed: ${totalRecordsProcessed}`);
-      console.log(`Event names found: ${Array.from(eventNames).join(', ')}`);
-      console.log(`Records with eventName='appointmentPatched': ${filteredRecords.length}`);
-      console.log('Filtered records:', filteredRecords.map(record => record.eventData?.id));
-      // Step 3: Limit to max events (in case last file pushed us over)
-      const recordsToSend = filteredRecords.slice(0, this.maxEventsToProcess);
-      if (filteredRecords.length > this.maxEventsToProcess) {
-        console.log(`⚠️  Limiting to ${this.maxEventsToProcess} events (found ${filteredRecords.length} total)`);
-      }
-
-      // Step 4: Send to Firehose
-      await this.sendToFirehose(recordsToSend);
+      const failedCount = sendResults.filter(result => !result.success).length;
+      console.log(`\n📊 Summary: Sent ${sentCount} records from ${sendResults.length} file(s), deleted ${filesToDelete.length} S3 file(s)${failedCount > 0 ? `, ${failedCount} failed` : ''}`);
 
       console.log('\n✓ Process completed successfully!');
     } catch (error) {
