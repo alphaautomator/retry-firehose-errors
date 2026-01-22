@@ -20,7 +20,7 @@ class StepFunctionTrigger {
   private startDate: Date;
   private endDate: Date;
   private intervalMinutes: number = 5;
-  private readonly concurrency: number = 5;
+  private readonly concurrency: number = 1;
 
   constructor() {
     const region = process.env.AWS_REGION || 'us-east-1';
@@ -119,7 +119,7 @@ class StepFunctionTrigger {
    */
   private generateExecutionName(time: Date): string {
     const timestamp = time.toISOString().replace(/[:.]/g, '-').replace('Z', '');
-    return `retry-execution-${timestamp}`;
+    return `retry-execution-1-${timestamp}`;
   }
 
   /**
@@ -161,46 +161,46 @@ class StepFunctionTrigger {
 
     const executionName = this.generateExecutionName(time);
     
-    // Check if execution already exists
-    const existingExecution = await this.checkExecutionStatus(executionName);
+    // // Check if execution already exists
+    // const existingExecution = await this.checkExecutionStatus(executionName);
     
-    if (existingExecution.exists) {
-      const status = existingExecution.status;
+    // if (existingExecution.exists) {
+    //   const status = existingExecution.status;
       
-      // If execution exists and succeeded or is running, skip it
-      if (status === 'SUCCEEDED' || status === 'RUNNING') {
-        return {
-          time: timeStr,
-          executionArn: existingExecution.arn,
-          success: true,
-          skipped: true,
-        };
-      }
+    //   // If execution exists and succeeded or is running, skip it
+    //   if (status === 'SUCCEEDED' || status === 'RUNNING') {
+    //     return {
+    //       time: timeStr,
+    //       executionArn: existingExecution.arn,
+    //       success: true,
+    //       skipped: true,
+    //     };
+    //   }
       
-      // If execution failed, use redrive to retry it
-      if (status === 'FAILED' || status === 'TIMED_OUT' || status === 'ABORTED') {
-        try {
-          const redriveCommand = new RedriveExecutionCommand({
-            executionArn: existingExecution.arn,
-          });
+    //   // If execution failed, use redrive to retry it
+    //   if (status === 'FAILED' || status === 'TIMED_OUT' || status === 'ABORTED') {
+    //     try {
+    //       const redriveCommand = new RedriveExecutionCommand({
+    //         executionArn: existingExecution.arn,
+    //       });
 
-          const redriveResponse = await this.sfnClient.send(redriveCommand);
+    //       const redriveResponse = await this.sfnClient.send(redriveCommand);
 
-          return {
-            time: timeStr,
-            executionArn: redriveResponse.redriveDate ? existingExecution.arn : undefined,
-            success: true,
-            redriven: true,
-          };
-        } catch (error: any) {
-          return {
-            time: timeStr,
-            success: false,
-            error: `Redrive failed: ${error.message || String(error)}`,
-          };
-        }
-      }
-    }
+    //       return {
+    //         time: timeStr,
+    //         executionArn: redriveResponse.redriveDate ? existingExecution.arn : undefined,
+    //         success: true,
+    //         redriven: true,
+    //       };
+    //     } catch (error: any) {
+    //       return {
+    //         time: timeStr,
+    //         success: false,
+    //         error: `Redrive failed: ${error.message || String(error)}`,
+    //       };
+    //     }
+    //   }
+    // }
 
     // Execution doesn't exist, create it
     try {
